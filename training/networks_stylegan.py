@@ -239,11 +239,18 @@ def leaky_relu(x, alpha=0.2):
 def pixel_norm(x, epsilon=1e-8):
     with tf.variable_scope('PixelNorm'):
         epsilon = tf.constant(epsilon, dtype=x.dtype, name='epsilon')
+        # 标准差：https://baike.baidu.com/item/%E6%A0%87%E5%87%86%E5%B7%AE/1415772?fr=aladdin
+        # square是平方，sqrt是开方，rsqrt是倒数
+        # 数据x先平方，然后求第一维平均数，比如[bs, 512]会变成[bs, 1]，如果keepdims为False，那就是[bs]，加上偏置eps
+        # 开平方得到每一个batch上的scale值（标准差），然后用x除以这个值（乘上这个值的倒数）
+        # 比如得到的scale值为2，因为是rsqrt而不是sqrt，所以对着x乘上去的是0.5而不是2，每个元素都缩小一倍
+        # 总结起来，这个方法让每一个元素都按着同一dim的标准差缩放，比如标准差大小为2，所有元素就缩放为原来的一半
         return x * tf.rsqrt(tf.reduce_mean(tf.square(x), axis=1, keepdims=True) + epsilon)
 
 #----------------------------------------------------------------------------
 # Instance normalization.
 
+# 求一张特征图HW上的平均值和标准差，然后对x减平均值，用标准差缩放
 def instance_norm(x, epsilon=1e-8):
     assert len(x.shape) == 4 # NCHW
     with tf.variable_scope('InstanceNorm'):
@@ -260,8 +267,11 @@ def instance_norm(x, epsilon=1e-8):
 
 def style_mod(x, dlatent, **kwargs):
     with tf.variable_scope('StyleMod'):
+        # 仿射变换，让dlatent过一个linear得到2倍维度的style
         style = apply_bias(dense(dlatent, fmaps=x.shape[1]*2, gain=1, **kwargs))
+        # 把[bs, 512 * 2]变为[bs, 2, 512, 1, 1]
         style = tf.reshape(style, [-1, 2, x.shape[1]] + [1] * (len(x.shape) - 2))
+        # 前512维+1后乘x，再加上后512维的bias
         return x * (style[:,0] + 1) + style[:,1]
 
 #----------------------------------------------------------------------------
@@ -408,9 +418,14 @@ def G_mapping(
 
     # Embed labels and concatenate them with latents.
     if label_size:
+        # 名字域，类似命名空间，不同命名空间下可以有同名变量，常常先声明一个命名空间，然后在下面get_variable作为参数，这个参数可以被轻松取得
         with tf.variable_scope('LabelConcat'):
+            # 新建权重变量，有则直接获得，无则创建一个，把label_size变成latent_size维度。权重[i, o]能够完成从i维到o维的变换
             w = tf.get_variable('weight', shape=[label_size, latent_size], initializer=tf.initializers.random_normal())
+            # 矩阵乘法，矩阵1乘以矩阵2，矩阵1是[bs, label_size]的，矩阵2是[label_size, latent_size]的
+            # 结果是[bs, latent_size]的，矩阵乘法的作用和linear是一样的，linear底层就是这么做的
             y = tf.matmul(labels_in, tf.cast(w, dtype))
+            # 在维度1上拼接，得到的结果x是[bs, 2*latent_size]的，也就是输入label以后，label会被变成一份latent贴到后面
             x = tf.concat([x, y], axis=1)
 
     # Normalize latents.
@@ -420,18 +435,25 @@ def G_mapping(
     # Mapping layers.
     for layer_idx in range(mapping_layers):
         with tf.variable_scope('Dense%d' % layer_idx):
+            # 这一层的输出维度是中间维度还是最终维度
             fmaps = dlatent_size if layer_idx == mapping_layers - 1 else mapping_fmaps
+            # 用一个矩阵去乘，其实也就是一个linear
             x = dense(x, fmaps=fmaps, gain=gain, use_wscale=use_wscale, lrmul=mapping_lrmul)
+            # 增加一个偏置(矩阵乘没有偏置)
             x = apply_bias(x, lrmul=mapping_lrmul)
+            # 激活一下
             x = act(x)
 
     # Broadcast.
+    # 需要复制到每一层就复制n份给每一层用
     if dlatent_broadcast is not None:
         with tf.variable_scope('Broadcast'):
             x = tf.tile(x[:, np.newaxis], [1, dlatent_broadcast, 1])
 
     # Output.
     assert x.dtype == tf.as_dtype(dtype)
+    # https://blog.csdn.net/hu_guan_jie/article/details/78495297，作用和赋值一致，但是会在计算图创造新的结点，不必深究
+    # https://www.zhihu.com/question/62517998/answer/555021799
     return tf.identity(x, name='dlatents_out')
 
 #----------------------------------------------------------------------------
