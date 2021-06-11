@@ -15,19 +15,23 @@ import dnnlib.tflib as tflib
 # NOTE: Do not import any application-specific modules here!
 # Specify all network parameters as kwargs.
 
-#----------------------------------------------------------------------------
+# ----------------------------------------------------------------------------
 # Primitive ops for manipulating 4D activation tensors.
 # The gradients of these are not necessary efficient or even meaningful.
 
+
+# 一个CNN层，用特定的卷积核去卷，stride决定卷完是不变还是变成一半实现下采样
 def _blur2d(x, f=[1,2,1], normalize=True, flip=False, stride=1):
     assert x.shape.ndims == 4 and all(dim.value is not None for dim in x.shape[1:])
     assert isinstance(stride, int) and stride >= 1
 
     # Finalize filter kernel.
     f = np.array(f, dtype=np.float32)
+    # f[[1,2,1],[2,4,2],[1,2,1]]
     if f.ndim == 1:
         f = f[:, np.newaxis] * f[np.newaxis, :]
     assert f.ndim == 2
+    # 进行一个缩放，使每个位置的权重和为1. f[[0.0625,0.125,0.0625],[0.125,0.25,0.125],[0.0625,0.125,0.0625]]
     if normalize:
         f /= np.sum(f)
     if flip:
@@ -48,6 +52,8 @@ def _blur2d(x, f=[1,2,1], normalize=True, flip=False, stride=1):
     x = tf.cast(x, orig_dtype)
     return x
 
+
+# 直接复制一倍，用tile在HW维度上都扩大factor倍，gain为加权权重，默认为1
 def _upscale2d(x, factor=2, gain=1):
     assert x.shape.ndims == 4 and all(dim.value is not None for dim in x.shape[1:])
     assert isinstance(factor, int) and factor >= 1
@@ -67,11 +73,13 @@ def _upscale2d(x, factor=2, gain=1):
     x = tf.reshape(x, [-1, s[1], s[2] * factor, s[3] * factor])
     return x
 
+
+# 下采样，如果factor为2，用conv下采样。如果factor大于2，用avg_pool完成下采样
 def _downscale2d(x, factor=2, gain=1):
     assert x.shape.ndims == 4 and all(dim.value is not None for dim in x.shape[1:])
     assert isinstance(factor, int) and factor >= 1
 
-    # 2x2, float32 => downscale using _blur2d().
+    # 2x2, float32 => downscale using _blur2d(). f: [0.5, 0.5]
     if factor == 2 and x.dtype == tf.float32:
         f = [np.sqrt(gain) / factor] * factor
         return _blur2d(x, f=f, normalize=False, stride=factor)
@@ -88,10 +96,10 @@ def _downscale2d(x, factor=2, gain=1):
     # NOTE: Requires tf_config['graph_options.place_pruned_graph']=True to work.
     ksize = [1, 1, factor, factor]
     return tf.nn.avg_pool(x, ksize=ksize, strides=ksize, padding='VALID', data_format='NCHW')
-
-#----------------------------------------------------------------------------
+# ----------------------------------------------------------------------------
 # High-level ops for manipulating 4D activation tensors.
 # The gradients of these are meant to be as efficient as possible.
+
 
 def blur2d(x, f=[1,2,1], normalize=True):
     with tf.variable_scope('Blur2D'):
@@ -105,6 +113,7 @@ def blur2d(x, f=[1,2,1], normalize=True):
             return y, grad
         return func(x)
 
+
 def upscale2d(x, factor=2):
     with tf.variable_scope('Upscale2D'):
         @tf.custom_gradient
@@ -117,6 +126,7 @@ def upscale2d(x, factor=2):
             return y, grad
         return func(x)
 
+
 def downscale2d(x, factor=2):
     with tf.variable_scope('Downscale2D'):
         @tf.custom_gradient
@@ -128,9 +138,9 @@ def downscale2d(x, factor=2):
                 return dx, lambda ddx: _downscale2d(ddx, factor)
             return y, grad
         return func(x)
-
-#----------------------------------------------------------------------------
+# ----------------------------------------------------------------------------
 # Get/create weight tensor for a convolutional or fully-connected layer.
+
 
 def get_weight(shape, gain=np.sqrt(2), use_wscale=False, lrmul=1):
     fan_in = np.prod(shape[:-1]) # [kernel, kernel, fmaps_in, fmaps_out] or [in, out]
@@ -147,9 +157,9 @@ def get_weight(shape, gain=np.sqrt(2), use_wscale=False, lrmul=1):
     # Create variable.
     init = tf.initializers.random_normal(0, init_std)
     return tf.get_variable('weight', shape=shape, initializer=init) * runtime_coef
-
-#----------------------------------------------------------------------------
+# ----------------------------------------------------------------------------
 # Fully-connected layer.
+
 
 def dense(x, fmaps, **kwargs):
     if len(x.shape) > 2:
@@ -157,19 +167,20 @@ def dense(x, fmaps, **kwargs):
     w = get_weight([x.shape[1].value, fmaps], **kwargs)
     w = tf.cast(w, x.dtype)
     return tf.matmul(x, w)
-
-#----------------------------------------------------------------------------
+# ----------------------------------------------------------------------------
 # Convolutional layer.
+# 和blur2d的区别在于，用的是conv2d而不是deepwise的conv，而且stride是定死的，而不像blur2d可以设定的
+
 
 def conv2d(x, fmaps, kernel, **kwargs):
     assert kernel >= 1 and kernel % 2 == 1
     w = get_weight([kernel, kernel, x.shape[1].value, fmaps], **kwargs)
     w = tf.cast(w, x.dtype)
     return tf.nn.conv2d(x, w, strides=[1,1,1,1], padding='SAME', data_format='NCHW')
-
-#----------------------------------------------------------------------------
+# ----------------------------------------------------------------------------
 # Fused convolution + scaling.
 # Faster and uses less memory than performing the operations separately.
+
 
 def upscale2d_conv2d(x, fmaps, kernel, fused_scale='auto', **kwargs):
     assert kernel >= 1 and kernel % 2 == 1
@@ -190,6 +201,7 @@ def upscale2d_conv2d(x, fmaps, kernel, fused_scale='auto', **kwargs):
     os = [tf.shape(x)[0], fmaps, x.shape[2] * 2, x.shape[3] * 2]
     return tf.nn.conv2d_transpose(x, w, os, strides=[1,1,2,2], padding='SAME', data_format='NCHW')
 
+
 def conv2d_downscale2d(x, fmaps, kernel, fused_scale='auto', **kwargs):
     assert kernel >= 1 and kernel % 2 == 1
     assert fused_scale in [True, False, 'auto']
@@ -206,9 +218,10 @@ def conv2d_downscale2d(x, fmaps, kernel, fused_scale='auto', **kwargs):
     w = tf.add_n([w[1:, 1:], w[:-1, 1:], w[1:, :-1], w[:-1, :-1]]) * 0.25
     w = tf.cast(w, x.dtype)
     return tf.nn.conv2d(x, w, strides=[1,1,2,2], padding='SAME', data_format='NCHW')
-
-#----------------------------------------------------------------------------
+# ----------------------------------------------------------------------------
 # Apply bias to the given activation tensor.
+# 对每一个通道的fm加上同一个bias值
+
 
 def apply_bias(x, lrmul=1):
     b = tf.get_variable('bias', shape=[x.shape[1]], initializer=tf.initializers.zeros()) * lrmul
@@ -216,9 +229,9 @@ def apply_bias(x, lrmul=1):
     if len(x.shape) == 2:
         return x + b
     return x + tf.reshape(b, [1, -1, 1, 1])
-
-#----------------------------------------------------------------------------
+# ----------------------------------------------------------------------------
 # Leaky ReLU activation. More efficient than tf.nn.leaky_relu() and supports FP16.
+
 
 def leaky_relu(x, alpha=0.2):
     with tf.variable_scope('LeakyReLU'):
@@ -232,9 +245,9 @@ def leaky_relu(x, alpha=0.2):
                 return dx, lambda ddx: tf.where(y >= 0, ddx, ddx * alpha)
             return y, grad
         return func(x)
-
-#----------------------------------------------------------------------------
+# ----------------------------------------------------------------------------
 # Pixelwise feature vector normalization.
+
 
 def pixel_norm(x, epsilon=1e-8):
     with tf.variable_scope('PixelNorm'):
@@ -246,9 +259,9 @@ def pixel_norm(x, epsilon=1e-8):
         # 比如得到的scale值为2，因为是rsqrt而不是sqrt，所以对着x乘上去的是0.5而不是2，每个元素都缩小一倍
         # 总结起来，这个方法让每一个元素都按着同一dim的标准差缩放，比如标准差大小为2，所有元素就缩放为原来的一半
         return x * tf.rsqrt(tf.reduce_mean(tf.square(x), axis=1, keepdims=True) + epsilon)
-
-#----------------------------------------------------------------------------
+# ----------------------------------------------------------------------------
 # Instance normalization.
+
 
 # 求一张特征图HW上的平均值和标准差，然后对x减平均值，用标准差缩放
 def instance_norm(x, epsilon=1e-8):
@@ -261,9 +274,9 @@ def instance_norm(x, epsilon=1e-8):
         x *= tf.rsqrt(tf.reduce_mean(tf.square(x), axis=[2,3], keepdims=True) + epsilon)
         x = tf.cast(x, orig_dtype)
         return x
-
-#----------------------------------------------------------------------------
+# ----------------------------------------------------------------------------
 # Style modulation.
+
 
 def style_mod(x, dlatent, **kwargs):
     with tf.variable_scope('StyleMod'):
@@ -273,9 +286,9 @@ def style_mod(x, dlatent, **kwargs):
         style = tf.reshape(style, [-1, 2, x.shape[1]] + [1] * (len(x.shape) - 2))
         # 前512维+1后乘x，再加上后512维的bias
         return x * (style[:,0] + 1) + style[:,1]
-
-#----------------------------------------------------------------------------
+# ----------------------------------------------------------------------------
 # Noise input.
+
 
 def apply_noise(x, noise_var=None, randomize_noise=True):
     assert len(x.shape) == 4 # NCHW
@@ -286,28 +299,13 @@ def apply_noise(x, noise_var=None, randomize_noise=True):
             noise = tf.cast(noise_var, x.dtype)
         weight = tf.get_variable('weight', shape=[x.shape[1].value], initializer=tf.initializers.zeros())
         return x + noise * tf.reshape(tf.cast(weight, x.dtype), [1, -1, 1, 1])
-
-#----------------------------------------------------------------------------
-# Minibatch standard deviation.
-
-def minibatch_stddev_layer(x, group_size=4, num_new_features=1):
-    with tf.variable_scope('MinibatchStddev'):
-        group_size = tf.minimum(group_size, tf.shape(x)[0])     # Minibatch must be divisible by (or smaller than) group_size.
-        s = x.shape                                             # [NCHW]  Input shape.
-        y = tf.reshape(x, [group_size, -1, num_new_features, s[1]//num_new_features, s[2], s[3]])   # [GMncHW] Split minibatch into M groups of size G. Split channels into n channel groups c.
-        y = tf.cast(y, tf.float32)                              # [GMncHW] Cast to FP32.
-        y -= tf.reduce_mean(y, axis=0, keepdims=True)           # [GMncHW] Subtract mean over group.
-        y = tf.reduce_mean(tf.square(y), axis=0)                # [MncHW]  Calc variance over group.
-        y = tf.sqrt(y + 1e-8)                                   # [MncHW]  Calc stddev over group.
-        y = tf.reduce_mean(y, axis=[2,3,4], keepdims=True)      # [Mn111]  Take average over fmaps and pixels.
-        y = tf.reduce_mean(y, axis=[2])                         # [Mn11] Split channels into c channel groups
-        y = tf.cast(y, x.dtype)                                 # [Mn11]  Cast back to original data type.
-        y = tf.tile(y, [group_size, 1, s[2], s[3]])             # [NnHW]  Replicate over group and pixels.
-        return tf.concat([x, y], axis=1)                        # [NCHW]  Append as new fmap.
-
-#----------------------------------------------------------------------------
+# ----------------------------------------------------------------------------
 # Style-based generator used in the StyleGAN paper.
 # Composed of two sub-networks (G_mapping and G_synthesis) that are defined below.
+
+
+# ====================================== 上面是基础组件，下面是用上面的乐高搭的模型 ======================================
+
 
 def G_style(
     latents_in,                                     # First input: Latent vectors (Z) [minibatch, latent_size].
@@ -387,9 +385,9 @@ def G_style(
     with tf.control_dependencies([tf.assign(components.synthesis.find_var('lod'), lod_in)]):
         images_out = components.synthesis.get_output_for(dlatents, force_clean_graph=is_template_graph, **kwargs)
     return tf.identity(images_out, name='images_out')
-
-#----------------------------------------------------------------------------
+# ----------------------------------------------------------------------------
 # Mapping network used in the StyleGAN paper.
+
 
 def G_mapping(
     latents_in,                             # First input: Latent vectors (Z) [minibatch, latent_size].
@@ -455,9 +453,9 @@ def G_mapping(
     # https://blog.csdn.net/hu_guan_jie/article/details/78495297，作用和赋值一致，但是会在计算图创造新的结点，不必深究
     # https://www.zhihu.com/question/62517998/answer/555021799
     return tf.identity(x, name='dlatents_out')
-
-#----------------------------------------------------------------------------
+# ----------------------------------------------------------------------------
 # Synthesis network used in the StyleGAN paper.
+
 
 def G_synthesis(
     dlatents_in,                        # Input: Disentangled latents (W) [minibatch, num_layers, dlatent_size].
@@ -486,9 +484,11 @@ def G_synthesis(
     resolution_log2 = int(np.log2(resolution))
     assert resolution == 2**resolution_log2 and resolution >= 4
     def nf(stage): return min(int(fmap_base / (2.0 ** (stage * fmap_decay))), fmap_max)
+    # 一个3x3的卷积操作
     def blur(x): return blur2d(x, blur_filter) if blur_filter else x
     if is_template_graph: force_clean_graph = True
     if force_clean_graph: randomize_noise = False
+    # 默认情况下 auto = recursive
     if structure == 'auto': structure = 'linear' if force_clean_graph else 'recursive'
     act, gain = {'relu': (tf.nn.relu, np.sqrt(2)), 'lrelu': (leaky_relu, np.sqrt(2))}[nonlinearity]
     num_layers = resolution_log2 * 2 - 2
@@ -579,105 +579,6 @@ def G_synthesis(
 
     assert images_out.dtype == tf.as_dtype(dtype)
     return tf.identity(images_out, name='images_out')
-
-#----------------------------------------------------------------------------
+# ----------------------------------------------------------------------------
 # Discriminator used in the StyleGAN paper.
 
-def D_basic(
-    images_in,                          # First input: Images [minibatch, channel, height, width].
-    labels_in,                          # Second input: Labels [minibatch, label_size].
-    num_channels        = 1,            # Number of input color channels. Overridden based on dataset.
-    resolution          = 32,           # Input resolution. Overridden based on dataset.
-    label_size          = 0,            # Dimensionality of the labels, 0 if no labels. Overridden based on dataset.
-    fmap_base           = 8192,         # Overall multiplier for the number of feature maps.
-    fmap_decay          = 1.0,          # log2 feature map reduction when doubling the resolution.
-    fmap_max            = 512,          # Maximum number of feature maps in any layer.
-    nonlinearity        = 'lrelu',      # Activation function: 'relu', 'lrelu',
-    use_wscale          = True,         # Enable equalized learning rate?
-    mbstd_group_size    = 4,            # Group size for the minibatch standard deviation layer, 0 = disable.
-    mbstd_num_features  = 1,            # Number of features for the minibatch standard deviation layer.
-    dtype               = 'float32',    # Data type to use for activations and outputs.
-    fused_scale         = 'auto',       # True = fused convolution + scaling, False = separate ops, 'auto' = decide automatically.
-    blur_filter         = [1,2,1],      # Low-pass filter to apply when resampling activations. None = no filtering.
-    structure           = 'auto',       # 'fixed' = no progressive growing, 'linear' = human-readable, 'recursive' = efficient, 'auto' = select automatically.
-    is_template_graph   = False,        # True = template graph constructed by the Network class, False = actual evaluation.
-    **_kwargs):                         # Ignore unrecognized keyword args.
-
-    resolution_log2 = int(np.log2(resolution))
-    assert resolution == 2**resolution_log2 and resolution >= 4
-    def nf(stage): return min(int(fmap_base / (2.0 ** (stage * fmap_decay))), fmap_max)
-    def blur(x): return blur2d(x, blur_filter) if blur_filter else x
-    if structure == 'auto': structure = 'linear' if is_template_graph else 'recursive'
-    act, gain = {'relu': (tf.nn.relu, np.sqrt(2)), 'lrelu': (leaky_relu, np.sqrt(2))}[nonlinearity]
-
-    images_in.set_shape([None, num_channels, resolution, resolution])
-    labels_in.set_shape([None, label_size])
-    images_in = tf.cast(images_in, dtype)
-    labels_in = tf.cast(labels_in, dtype)
-    lod_in = tf.cast(tf.get_variable('lod', initializer=np.float32(0.0), trainable=False), dtype)
-    scores_out = None
-
-    # Building blocks.
-    def fromrgb(x, res): # res = 2..resolution_log2
-        with tf.variable_scope('FromRGB_lod%d' % (resolution_log2 - res)):
-            return act(apply_bias(conv2d(x, fmaps=nf(res-1), kernel=1, gain=gain, use_wscale=use_wscale)))
-    def block(x, res): # res = 2..resolution_log2
-        with tf.variable_scope('%dx%d' % (2**res, 2**res)):
-            if res >= 3: # 8x8 and up
-                with tf.variable_scope('Conv0'):
-                    x = act(apply_bias(conv2d(x, fmaps=nf(res-1), kernel=3, gain=gain, use_wscale=use_wscale)))
-                with tf.variable_scope('Conv1_down'):
-                    x = act(apply_bias(conv2d_downscale2d(blur(x), fmaps=nf(res-2), kernel=3, gain=gain, use_wscale=use_wscale, fused_scale=fused_scale)))
-            else: # 4x4
-                if mbstd_group_size > 1:
-                    x = minibatch_stddev_layer(x, mbstd_group_size, mbstd_num_features)
-                with tf.variable_scope('Conv'):
-                    x = act(apply_bias(conv2d(x, fmaps=nf(res-1), kernel=3, gain=gain, use_wscale=use_wscale)))
-                with tf.variable_scope('Dense0'):
-                    x = act(apply_bias(dense(x, fmaps=nf(res-2), gain=gain, use_wscale=use_wscale)))
-                with tf.variable_scope('Dense1'):
-                    x = apply_bias(dense(x, fmaps=max(label_size, 1), gain=1, use_wscale=use_wscale))
-            return x
-
-    # Fixed structure: simple and efficient, but does not support progressive growing.
-    if structure == 'fixed':
-        x = fromrgb(images_in, resolution_log2)
-        for res in range(resolution_log2, 2, -1):
-            x = block(x, res)
-        scores_out = block(x, 2)
-
-    # Linear structure: simple but inefficient.
-    if structure == 'linear':
-        img = images_in
-        x = fromrgb(img, resolution_log2)
-        for res in range(resolution_log2, 2, -1):
-            lod = resolution_log2 - res
-            x = block(x, res)
-            img = downscale2d(img)
-            y = fromrgb(img, res - 1)
-            with tf.variable_scope('Grow_lod%d' % lod):
-                x = tflib.lerp_clip(x, y, lod_in - lod)
-        scores_out = block(x, 2)
-
-    # Recursive structure: complex but efficient.
-    if structure == 'recursive':
-        def cset(cur_lambda, new_cond, new_lambda):
-            return lambda: tf.cond(new_cond, new_lambda, cur_lambda)
-        def grow(res, lod):
-            x = lambda: fromrgb(downscale2d(images_in, 2**lod), res)
-            if lod > 0: x = cset(x, (lod_in < lod), lambda: grow(res + 1, lod - 1))
-            x = block(x(), res); y = lambda: x
-            if res > 2: y = cset(y, (lod_in > lod), lambda: tflib.lerp(x, fromrgb(downscale2d(images_in, 2**(lod+1)), res - 1), lod_in - lod))
-            return y()
-        scores_out = grow(2, resolution_log2 - 2)
-
-    # Label conditioning from "Which Training Methods for GANs do actually Converge?"
-    if label_size:
-        with tf.variable_scope('LabelSwitch'):
-            scores_out = tf.reduce_sum(scores_out * labels_in, axis=1, keepdims=True)
-
-    assert scores_out.dtype == tf.as_dtype(dtype)
-    scores_out = tf.identity(scores_out, name='scores_out')
-    return scores_out
-
-#----------------------------------------------------------------------------
